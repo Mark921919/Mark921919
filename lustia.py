@@ -6,6 +6,7 @@ import csv
 import io
 import sqlite3
 import threading
+import re
 import xml.etree.ElementTree as ET
 import requests
 from datetime import datetime
@@ -145,10 +146,23 @@ def get_columns(db_id: int) -> list[str]:
     return cols
 
 
+def _sanitize_fts_query(query: str) -> str:
+    """Escape special FTS5 characters by splitting on non-word chars and quoting."""
+    tokens = re.findall(r"[\w]+", query, re.UNICODE)
+    if not tokens:
+        return '""'
+    quoted = []
+    for t in tokens:
+        t = t.replace('"', '""')
+        quoted.append(f'"{t}"')
+    return " ".join(quoted)
+
+
 def search_records_db(
     query: str, limit: int = 50, offset: int = 0, db_name: str | None = None
 ) -> tuple[list[dict], int]:
     conn = _get_conn()
+    query = _sanitize_fts_query(query)
     if db_name:
         count_sql = """
             SELECT COUNT(*) AS cnt
