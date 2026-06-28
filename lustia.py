@@ -1023,12 +1023,7 @@ def get_files_bulk(path_input: str) -> list:
     return files
 
 def db_uploader():
-    cfg = load_config()
-    
-    if not cfg["base_url"]:
-        cfg["base_url"] = BASE_URL
-    
-    client = DBClient(cfg["base_url"], cfg.get("api_key", ""))
+    client = DBClient(BASE_URL, "")
     
     clear()
     print("\n" + c("═" * 70, Colors.BLOOD_RED + Colors.BOLD))
@@ -1117,11 +1112,7 @@ def db_uploader():
     input(c("\n[+] Нажмите Enter...", Colors.GRAY))
 
 def db_list():
-    cfg = load_config()
-    if not cfg["base_url"]:
-        cfg["base_url"] = BASE_URL
-    
-    client = DBClient(cfg["base_url"], cfg.get("api_key", ""))
+    client = DBClient(BASE_URL, "")
     
     clear()
     print("\n" + c("═" * 70, Colors.BLOOD_RED + Colors.BOLD))
