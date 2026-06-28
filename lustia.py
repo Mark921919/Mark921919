@@ -384,16 +384,21 @@ async def api_upload(file: UploadFile, name: str = Form(...)):
 
 @router.get("/databases")
 async def api_list_databases():
-    dbs = list_databases_db()
+    conn = _get_conn()
+    rows = conn.execute("""
+        SELECT d.id, d.name, d.created_at,
+               COUNT(r.id) AS row_count
+        FROM databases d
+        LEFT JOIN records r ON r.db_id = d.id
+        GROUP BY d.id
+        ORDER BY d.id
+    """).fetchall()
     result = []
-    for db in dbs:
-        cnt = count_records_db(db["id"])
-        columns = get_columns(db["id"])
+    for row in rows:
         result.append({
-            "name": db["name"],
-            "rowCount": cnt,
-            "columns": columns,
-            "createdAt": db["created_at"],
+            "name": row["name"],
+            "rowCount": row["row_count"],
+            "createdAt": row["created_at"],
         })
     return {"databases": result}
 
@@ -601,7 +606,7 @@ class DBClient:
         if self.headers:
             self.session.headers.update(self.headers)
 
-    def _get(self, path: str, params=None, timeout=30) -> dict:
+    def _get(self, path: str, params=None, timeout=120) -> dict:
         url = f"{self.base_url}{path}"
         r = self.session.get(url, params=params, timeout=timeout)
         r.raise_for_status()
@@ -1129,46 +1134,18 @@ def db_list():
     if not dbs:
         print(c("\n❌ Нет загруженных баз", Colors.YELLOW))
     else:
-        total_size = 0
+        total_rows = 0
         
         for i, db in enumerate(dbs, 1):
             db_name = db.get("name", "—")
             created = db.get("createdAt", "")[:10]
-            cols = db.get("columns", [])
             row_count = db.get("rowCount", 0)
-            
-            db_size = 0
-            try:
-                db_info = client.get_database_info(db_name)
-                if db_info:
-                    db_size = db_info.get("size", 0)
-                    if not db_size:
-                        db_size = db_info.get("sizeBytes", 0)
-                    if not db_size:
-                        db_size = db_info.get("fileSize", 0)
-            except Exception:
-                db_size = row_count * 500 + len(cols) * 100
-            
-            total_size += db_size
-            
-            col_preview = ", ".join(cols[:5]) + (f" +{len(cols)-5}" if len(cols) > 5 else "")
+            total_rows += row_count
             
             print(c(f"\n[{i}] ", Colors.DARK_RED + Colors.BOLD) + c(db_name, Colors.WHITE + Colors.BOLD))
             print(c(f"    📊 {row_count:,} строк  |  📅 {created}", Colors.GRAY))
-            print(c(f"    🗂  {col_preview}", Colors.GRAY))
-            
-            size_str = fmt_size(db_size)
-            if db_size > 100 * 1024 * 1024:
-                size_color = Colors.RED
-            elif db_size > 10 * 1024 * 1024:
-                size_color = Colors.YELLOW
-            else:
-                size_color = Colors.GREEN
-            
-            print(c(f"    💾 {size_str}", size_color))
         
-        print(c(f"\n📊 Всего: {len(dbs)} баз", Colors.GREEN))
-        print(c(f"💾 Общий размер: {fmt_size(total_size)}", Colors.CYAN))
+        print(c(f"\n📊 Всего: {len(dbs)} баз, {total_rows:,} строк", Colors.GREEN))
     
     input(c("\n[+] Нажмите Enter...", Colors.GRAY))
 
