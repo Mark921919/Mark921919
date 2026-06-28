@@ -1,6 +1,6 @@
-# DB Search API
+# Lustia API Search
 
-Fast API for uploading and searching databases with sub-second response times.
+Lustia API for uploading and searching databases with sub-second response times.
 
 ## Features
 
@@ -22,10 +22,10 @@ API docs: http://localhost:8000/docs
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/v1/databases/upload?db_name=X` | Upload a CSV/JSON file |
-| GET | `/api/v1/databases` | List all databases |
-| DELETE | `/api/v1/databases/{db_name}` | Delete a database |
-| GET | `/api/v1/search?q=term` | Full-text search |
+| POST | `/lustia/api/search/databases/upload?db_name=X` | Upload a CSV/JSON file |
+| GET | `/lustia/api/search/databases` | List all databases |
+| DELETE | `/lustia/api/search/databases/{db_name}` | Delete a database |
+| GET | `/lustia/api/search/search?q=term` | Full-text search |
 
 ## Running tests
 
