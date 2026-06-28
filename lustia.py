@@ -593,6 +593,7 @@ BANNER = f"""
 {c('│', D)}  {c('[8]', R)} - Поиск по нику     {c('│', D)}  {c('[11]', R)} - Скоро...           {c('│', D)}
 {c('│', D)}  {c('[9]', R)} - Multisearch       {c('│', D)}  {c('[12]', R)} - Я боюсь нато       {c('│', D)}
 {c('│', D)}  {c('[13]', R)} - DB Uploader      {c('│', D)}  {c('[14]', R)} - Список баз         {c('│', D)}
+{c('│', D)}  {c('[15]', R)} - GUI Загрузчик    {c('│', D)}                               {c('│', D)}
 {c('╰───────────────────────────────────────────────────────╯', D)}
 """
 
@@ -1043,33 +1044,10 @@ def get_files_bulk(path_input: str) -> list:
     
     return files
 
-def db_uploader():
+
+def _upload_files(files: list):
+    """Upload a list of Path objects to the API (shared logic)."""
     client = DBClient(BASE_URL, "")
-    
-    clear()
-    print("\n" + c("═" * 70, Colors.BLOOD_RED + Colors.BOLD))
-    print(c("  🔴 DB UPLOADER — Пакетная загрузка баз", Colors.RED + Colors.BOLD))
-    print(c("═" * 70, Colors.BLOOD_RED + Colors.BOLD))
-    
-    print(c("\n📌 Введите путь:", Colors.CYAN))
-    print(c("  • Папка: /home/user/data/          - загрузит ВСЕ файлы", Colors.GRAY))
-    print(c("  • Шаблон: *.csv                    - все CSV файлы", Colors.GRAY))
-    print(c("  • Файл: data.csv                   - конкретный файл", Colors.GRAY))
-    print(c(f"  • Поддерживаемые форматы: {', '.join(sorted(SUPPORTED))}", Colors.GRAY))
-    
-    path_input = input(c("\n[+] Путь: ", Colors.RED)).strip()
-    
-    if not path_input:
-        print(c("\n❌ Путь не указан", Colors.YELLOW))
-        input(c("\n[+] Нажмите Enter...", Colors.GRAY))
-        return
-    
-    files = get_files_bulk(path_input)
-    
-    if not files:
-        print(c(f"\n❌ Файлы не найдены: {path_input}", Colors.YELLOW))
-        input(c("\n[+] Нажмите Enter...", Colors.GRAY))
-        return
     
     print(c(f"\n📁 Найдено файлов: {len(files)}", Colors.GREEN))
     for f in files[:10]:
@@ -1081,7 +1059,7 @@ def db_uploader():
     total_size = sum(f.stat().st_size for f in files)
     print(c(f"\n💾 Общий размер: {fmt_size(total_size)}", Colors.CYAN))
     
-    confirm = input(c("\n[+] Начать ПАКЕТНУЮ загрузку ВСЕХ файлов? (да/нет): ", Colors.RED)).strip().lower()
+    confirm = input(c("\n[+] Начать загрузку? (да/нет): ", Colors.RED)).strip().lower()
     if confirm not in ['да', 'yes', 'y', 'д']:
         print(c("\n❌ Загрузка отменена", Colors.YELLOW))
         input(c("\n[+] Нажмите Enter...", Colors.GRAY))
@@ -1131,6 +1109,104 @@ def db_uploader():
             print(c(f"    • {f}", Colors.RED))
     
     input(c("\n[+] Нажмите Enter...", Colors.GRAY))
+
+
+def db_uploader_gui():
+    """GUI загрузчик баз данных через проводник (tkinter)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError:
+        print(c("\n❌ tkinter не установлен. Используй [13] для загрузки через путь.", Colors.RED))
+        input(c("\n[+] Нажмите Enter...", Colors.GRAY))
+        return
+    
+    clear()
+    print("\n" + c("═" * 70, Colors.BLOOD_RED + Colors.BOLD))
+    print(c("  🔴 DB UPLOADER — Графический загрузчик", Colors.RED + Colors.BOLD))
+    print(c("═" * 70, Colors.BLOOD_RED + Colors.BOLD))
+    
+    print(c("\n📌 Выберите способ:", Colors.CYAN))
+    print(c("  [1] - Выбрать файлы", Colors.GRAY))
+    print(c("  [2] - Выбрать папку (все файлы внутри)", Colors.GRAY))
+    
+    choice = input(c("\n[+] Выбор (1/2): ", Colors.RED)).strip()
+    
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    
+    filetypes = [
+        ("Все поддерживаемые", "*.csv *.tsv *.json *.xml *.xlsx *.xls *.txt"),
+        ("CSV", "*.csv"),
+        ("TSV", "*.tsv"),
+        ("JSON", "*.json"),
+        ("XML", "*.xml"),
+        ("Excel", "*.xlsx *.xls"),
+        ("Text", "*.txt"),
+        ("Все файлы", "*.*"),
+    ]
+    
+    files = []
+    
+    if choice == '2':
+        folder = filedialog.askdirectory(title="Выберите папку с базами данных")
+        root.destroy()
+        if not folder:
+            print(c("\n❌ Папка не выбрана", Colors.YELLOW))
+            input(c("\n[+] Нажмите Enter...", Colors.GRAY))
+            return
+        dir_path = Path(folder)
+        for f in sorted(dir_path.iterdir()):
+            if f.is_file() and f.suffix.lower() in SUPPORTED:
+                files.append(f)
+    else:
+        selected = filedialog.askopenfilenames(
+            title="Выберите файлы баз данных",
+            filetypes=filetypes,
+        )
+        root.destroy()
+        if not selected:
+            print(c("\n❌ Файлы не выбраны", Colors.YELLOW))
+            input(c("\n[+] Нажмите Enter...", Colors.GRAY))
+            return
+        files = [Path(f) for f in selected if Path(f).suffix.lower() in SUPPORTED]
+    
+    if not files:
+        print(c("\n❌ Нет поддерживаемых файлов", Colors.YELLOW))
+        input(c("\n[+] Нажмите Enter...", Colors.GRAY))
+        return
+    
+    _upload_files(files)
+
+
+def db_uploader():
+    clear()
+    print("\n" + c("═" * 70, Colors.BLOOD_RED + Colors.BOLD))
+    print(c("  🔴 DB UPLOADER — Пакетная загрузка баз", Colors.RED + Colors.BOLD))
+    print(c("═" * 70, Colors.BLOOD_RED + Colors.BOLD))
+    
+    print(c("\n📌 Введите путь:", Colors.CYAN))
+    print(c("  • Папка: /home/user/data/          - загрузит ВСЕ файлы", Colors.GRAY))
+    print(c("  • Шаблон: *.csv                    - все CSV файлы", Colors.GRAY))
+    print(c("  • Файл: data.csv                   - конкретный файл", Colors.GRAY))
+    print(c(f"  • Поддерживаемые форматы: {', '.join(sorted(SUPPORTED))}", Colors.GRAY))
+    
+    path_input = input(c("\n[+] Путь: ", Colors.RED)).strip()
+    
+    if not path_input:
+        print(c("\n❌ Путь не указан", Colors.YELLOW))
+        input(c("\n[+] Нажмите Enter...", Colors.GRAY))
+        return
+    
+    files = get_files_bulk(path_input)
+    
+    if not files:
+        print(c(f"\n❌ Файлы не найдены: {path_input}", Colors.YELLOW))
+        input(c("\n[+] Нажмите Enter...", Colors.GRAY))
+        return
+    
+    _upload_files(files)
 
 def db_list():
     client = DBClient(BASE_URL, "")
@@ -1208,6 +1284,8 @@ def main():
             db_uploader()
         elif choice == '14':
             db_list()
+        elif choice == '15':
+            db_uploader_gui()
         
         else:
             print(c("[!] Неверный выбор", Colors.RED))
