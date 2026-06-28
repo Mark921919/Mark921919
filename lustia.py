@@ -2,25 +2,40 @@ import os
 import sys
 import time
 import json
+import csv
+import io
+import sqlite3
+import threading
+import xml.etree.ElementTree as ET
 import requests
 from datetime import datetime
 from pathlib import Path
-import argparse
 import configparser
 import glob
+from contextlib import asynccontextmanager
 
 try:
     from tqdm import tqdm
     from colorama import init, Fore, Style
     init(autoreset=True)
 except ImportError:
-    print("Установи зависимости: pip install requests tqdm colorama")
+    print("Установи зависимости: pip install requests tqdm colorama fastapi uvicorn python-multipart openpyxl")
+    sys.exit(1)
+
+try:
+    import uvicorn
+    from fastapi import FastAPI, APIRouter, Form, HTTPException, Query, UploadFile
+    from openpyxl import load_workbook
+except ImportError:
+    print("Установи зависимости: pip install fastapi uvicorn python-multipart openpyxl")
     sys.exit(1)
 
 # ========================== КОНФИГУРАЦИЯ ==========================
 
-BASE_URL = "http://localhost:8000/api"
-API_KEY = ""  # Не нужен для локального сервера
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 8000
+BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}/api"
+API_KEY = ""
 
 # Кеш для мгновенного поиска
 cache = {}
@@ -28,10 +43,473 @@ CACHE_TTL = 300  # 5 минут
 
 # Конфиг для загрузчика
 CONFIG_FILE = Path.home() / ".dbuploader.ini"
-SUPPORTED = {".csv", ".json", ".xlsx", ".xls", ".txt"}
+SUPPORTED = {".csv", ".json", ".xlsx", ".xls", ".txt", ".tsv", ".xml"}
 CHUNK_SIZE = 1024 * 1024  # 1 МБ
 MAX_RETRIES = 3
 RETRY_DELAY = 3  # сек
+
+# ========================== ВСТРОЕННЫЙ API СЕРВЕР ==========================
+
+_DB_DIR = Path(__file__).resolve().parent / "data"
+_DB_PATH = _DB_DIR / "store.db"
+_local = threading.local()
+
+
+def _get_conn() -> sqlite3.Connection:
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        _DB_DIR.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        _local.conn = conn
+    return conn
+
+
+def init_db() -> None:
+    conn = _get_conn()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS databases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            db_id INTEGER NOT NULL REFERENCES databases(id) ON DELETE CASCADE,
+            row_data TEXT NOT NULL
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
+            row_data, content='records', content_rowid='id'
+        );
+        CREATE TRIGGER IF NOT EXISTS records_ai AFTER INSERT ON records BEGIN
+            INSERT INTO records_fts(rowid, row_data) VALUES (new.id, new.row_data);
+        END;
+        CREATE TRIGGER IF NOT EXISTS records_ad AFTER DELETE ON records BEGIN
+            INSERT INTO records_fts(records_fts, rowid, row_data)
+                VALUES ('delete', old.id, old.row_data);
+        END;
+    """)
+    conn.commit()
+
+
+def create_database_entry(name: str) -> int:
+    conn = _get_conn()
+    cur = conn.execute("INSERT INTO databases (name) VALUES (?)", (name,))
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_database_entry(name: str) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute("SELECT * FROM databases WHERE name = ?", (name,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_databases_db() -> list[dict]:
+    conn = _get_conn()
+    rows = conn.execute("SELECT * FROM databases ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_database_entry(db_id: int) -> None:
+    conn = _get_conn()
+    conn.execute("DELETE FROM records WHERE db_id = ?", (db_id,))
+    conn.execute("DELETE FROM databases WHERE id = ?", (db_id,))
+    conn.commit()
+
+
+def insert_records_db(db_id: int, rows: list[str]) -> int:
+    conn = _get_conn()
+    conn.executemany(
+        "INSERT INTO records (db_id, row_data) VALUES (?, ?)",
+        [(db_id, r) for r in rows],
+    )
+    conn.commit()
+    return len(rows)
+
+
+def get_columns(db_id: int) -> list[str]:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT row_data FROM records WHERE db_id = ? LIMIT 1", (db_id,)
+    ).fetchone()
+    if not row:
+        return []
+    parts = row["row_data"].split(" | ")
+    cols = []
+    for p in parts:
+        if ": " in p:
+            cols.append(p.split(": ", 1)[0])
+    return cols
+
+
+def search_records_db(
+    query: str, limit: int = 50, offset: int = 0, db_name: str | None = None
+) -> tuple[list[dict], int]:
+    conn = _get_conn()
+    if db_name:
+        count_sql = """
+            SELECT COUNT(*) AS cnt
+            FROM records_fts fts
+            JOIN records r ON r.id = fts.rowid
+            JOIN databases d ON d.id = r.db_id
+            WHERE fts.row_data MATCH ? AND d.name = ?
+        """
+        total = conn.execute(count_sql, (query, db_name)).fetchone()["cnt"]
+        sql = """
+            SELECT r.id, d.name AS db_name, r.row_data, rank
+            FROM records_fts fts
+            JOIN records r ON r.id = fts.rowid
+            JOIN databases d ON d.id = r.db_id
+            WHERE fts.row_data MATCH ? AND d.name = ?
+            ORDER BY rank LIMIT ? OFFSET ?
+        """
+        rows = conn.execute(sql, (query, db_name, limit, offset)).fetchall()
+    else:
+        count_sql = """
+            SELECT COUNT(*) AS cnt
+            FROM records_fts fts
+            JOIN records r ON r.id = fts.rowid
+            WHERE fts.row_data MATCH ?
+        """
+        total = conn.execute(count_sql, (query,)).fetchone()["cnt"]
+        sql = """
+            SELECT r.id, d.name AS db_name, r.row_data, rank
+            FROM records_fts fts
+            JOIN records r ON r.id = fts.rowid
+            JOIN databases d ON d.id = r.db_id
+            WHERE fts.row_data MATCH ?
+            ORDER BY rank LIMIT ? OFFSET ?
+        """
+        rows = conn.execute(sql, (query, limit, offset)).fetchall()
+
+    results = []
+    for r in rows:
+        item: dict = {"database": r["db_name"]}
+        for part in r["row_data"].split(" | "):
+            if ": " in part:
+                k, v = part.split(": ", 1)
+                item[k] = v
+            else:
+                item["data"] = part
+        results.append(item)
+    return results, total
+
+
+def count_records_db(db_id: int) -> int:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM records WHERE db_id = ?", (db_id,)
+    ).fetchone()
+    return row["cnt"]
+
+
+# ========================== ПАРСЕР ФАЙЛОВ ==========================
+
+_ENCODINGS = ["utf-8", "utf-8-sig", "cp1251", "latin-1"]
+
+
+def _decode(content: bytes) -> str:
+    for enc in _ENCODINGS:
+        try:
+            return content.decode(enc)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return content.decode("latin-1")
+
+
+def parse_csv(content: bytes) -> list[str]:
+    text = _decode(content)
+    reader = csv.DictReader(io.StringIO(text))
+    rows = []
+    for record in reader:
+        row_text = " | ".join(f"{k}: {v}" for k, v in record.items() if v)
+        if row_text:
+            rows.append(row_text)
+    return rows
+
+
+def parse_tsv(content: bytes) -> list[str]:
+    text = _decode(content)
+    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+    rows = []
+    for record in reader:
+        row_text = " | ".join(f"{k}: {v}" for k, v in record.items() if v)
+        if row_text:
+            rows.append(row_text)
+    return rows
+
+
+def parse_json_file(content: bytes) -> list[str]:
+    text = _decode(content)
+    data = json.loads(text)
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = [data]
+    else:
+        raise ValueError(f"Unsupported JSON root type: {type(data).__name__}")
+    rows = []
+    for item in items:
+        if isinstance(item, dict):
+            row_text = " | ".join(
+                f"{k}: {v}" for k, v in item.items() if v is not None
+            )
+        else:
+            row_text = str(item)
+        if row_text:
+            rows.append(row_text)
+    return rows
+
+
+def parse_xml(content: bytes) -> list[str]:
+    root = ET.fromstring(content)
+    rows = []
+    for element in root:
+        parts = []
+        if element.text and element.text.strip():
+            parts.append(f"{element.tag}: {element.text.strip()}")
+        for child in element:
+            text = child.text.strip() if child.text else ""
+            if text:
+                parts.append(f"{child.tag}: {text}")
+            for attr_key, attr_val in child.attrib.items():
+                parts.append(f"{attr_key}: {attr_val}")
+        for attr_key, attr_val in element.attrib.items():
+            parts.append(f"{attr_key}: {attr_val}")
+        if parts:
+            rows.append(" | ".join(parts))
+    return rows
+
+
+def parse_excel(content: bytes) -> list[str]:
+    wb = load_workbook(filename=io.BytesIO(content), read_only=True, data_only=True)
+    rows = []
+    for sheet in wb.sheetnames:
+        ws = wb[sheet]
+        sheet_rows = list(ws.iter_rows(values_only=True))
+        if not sheet_rows:
+            continue
+        headers = [
+            str(h) if h is not None else f"col_{i}"
+            for i, h in enumerate(sheet_rows[0])
+        ]
+        for data_row in sheet_rows[1:]:
+            parts = []
+            for header, val in zip(headers, data_row):
+                if val is not None and str(val).strip():
+                    parts.append(f"{header}: {val}")
+            if parts:
+                rows.append(" | ".join(parts))
+    wb.close()
+    return rows
+
+
+def parse_txt(content: bytes) -> list[str]:
+    text = _decode(content)
+    rows = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            rows.append(stripped)
+    return rows
+
+
+SUPPORTED_EXTENSIONS = {
+    ".csv": "CSV", ".tsv": "TSV", ".json": "JSON",
+    ".xml": "XML", ".xlsx": "Excel", ".xls": "Excel", ".txt": "Text",
+}
+
+
+def parse_file(filename: str, content: bytes) -> list[str]:
+    lower = filename.lower()
+    if lower.endswith(".csv"):
+        return parse_csv(content)
+    if lower.endswith(".tsv"):
+        return parse_tsv(content)
+    if lower.endswith(".json"):
+        return parse_json_file(content)
+    if lower.endswith(".xml"):
+        return parse_xml(content)
+    if lower.endswith((".xlsx", ".xls")):
+        return parse_excel(content)
+    if lower.endswith(".txt"):
+        return parse_txt(content)
+    supported = ", ".join(SUPPORTED_EXTENSIONS.keys())
+    raise ValueError(f"Unsupported file type: {filename}. Supported: {supported}")
+
+
+# ========================== FASTAPI МАРШРУТЫ ==========================
+
+router = APIRouter()
+
+
+@router.post("/upload")
+async def api_upload(file: UploadFile, name: str = Form(...)):
+    start = time.perf_counter()
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="File has no name")
+    db_name = name.strip()[:100]
+    if not db_name:
+        raise HTTPException(status_code=400, detail="Empty database name")
+    existing = get_database_entry(db_name)
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Database '{db_name}' already exists")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+    try:
+        rows = parse_file(file.filename, content)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not rows:
+        raise HTTPException(status_code=400, detail="File contains no records")
+    db_id = create_database_entry(db_name)
+    inserted = insert_records_db(db_id, rows)
+    elapsed = time.perf_counter() - start
+    columns = get_columns(db_id)
+    return {
+        "ok": True,
+        "database": {
+            "name": db_name,
+            "rowCount": inserted,
+            "columns": columns,
+            "createdAt": get_database_entry(db_name)["created_at"],
+        },
+        "elapsed_seconds": round(elapsed, 4),
+    }
+
+
+@router.get("/databases")
+async def api_list_databases():
+    dbs = list_databases_db()
+    result = []
+    for db in dbs:
+        cnt = count_records_db(db["id"])
+        columns = get_columns(db["id"])
+        result.append({
+            "name": db["name"],
+            "rowCount": cnt,
+            "columns": columns,
+            "createdAt": db["created_at"],
+        })
+    return {"databases": result}
+
+
+@router.get("/databases/{db_name}")
+async def api_get_database(db_name: str):
+    entry = get_database_entry(db_name)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Database '{db_name}' not found")
+    cnt = count_records_db(entry["id"])
+    columns = get_columns(entry["id"])
+    return {
+        "name": entry["name"],
+        "rowCount": cnt,
+        "columns": columns,
+        "createdAt": entry["created_at"],
+    }
+
+
+@router.delete("/databases/{db_name}")
+async def api_delete_database(db_name: str):
+    entry = get_database_entry(db_name)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Database '{db_name}' not found")
+    delete_database_entry(entry["id"])
+    return {"ok": True, "deleted": db_name}
+
+
+@router.get("/formats")
+async def api_formats():
+    return {"formats": SUPPORTED_EXTENSIONS}
+
+
+@router.get("/search")
+async def api_search(
+    q: str = Query(..., min_length=1),
+    db: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=10000),
+    offset: int = Query(0, ge=0),
+):
+    start = time.perf_counter()
+    if db:
+        entry = get_database_entry(db)
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"Database '{db}' not found")
+    try:
+        results, total_count = search_records_db(q, limit=limit, offset=offset, db_name=db)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Search error: {exc}")
+    elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+    return {
+        "ok": True,
+        "results": results,
+        "count": total_count,
+        "totalCount": total_count,
+        "tookMs": elapsed_ms,
+    }
+
+
+@asynccontextmanager
+async def lifespan(a: FastAPI):
+    init_db()
+    yield
+
+
+api_app = FastAPI(
+    title="Lustia API Search",
+    description="Lustia API — загрузка и поиск по базам данных любого формата",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+api_app.include_router(router, prefix="/api")
+
+
+@api_app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+def _start_server():
+    """Запуск API сервера в фоновом потоке."""
+    import logging
+    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    config = uvicorn.Config(
+        api_app,
+        host=SERVER_HOST,
+        port=SERVER_PORT,
+        log_level="warning",
+    )
+    server = uvicorn.Server(config)
+    server.run()
+
+
+def ensure_server():
+    """Запускает сервер в фоне, если он ещё не запущен."""
+    try:
+        r = requests.get(f"http://{SERVER_HOST}:{SERVER_PORT}/health", timeout=2)
+        if r.status_code == 200:
+            return True
+    except Exception:
+        pass
+
+    t = threading.Thread(target=_start_server, daemon=True)
+    t.start()
+
+    for _ in range(30):
+        time.sleep(0.3)
+        try:
+            r = requests.get(f"http://{SERVER_HOST}:{SERVER_PORT}/health", timeout=2)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+    return False
+
 
 # ========================== ЦВЕТА ==========================
 
@@ -64,7 +542,6 @@ def hr():
     print(Fore.RED + Style.DIM + "─" * 70)
 
 def fmt_size(n: int) -> str:
-    """Форматирование размера в байтах в человекочитаемый вид"""
     if n == 0:
         return "0 Б"
     for unit in ["Б", "КБ", "МБ", "ГБ", "ТБ"]:
@@ -76,24 +553,24 @@ def fmt_size(n: int) -> str:
 # ========================== БАННЕР ==========================
 
 BANNER = f"""
-{c('╭───────────────────╮', Colors.DARK_RED)}	{c('╭───────────────────────────────────────────────────────────────────────────────╮', Colors.DARK_RED)} {c('╭───────────────────╮', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}		      {c('│', Colors.DARK_RED)}	{c('│', Colors.DARK_RED)}    	{c('▄▄▄', Colors.RED)}      {c('▄▄▄', Colors.DARK_RED)}  {c('▄▄▄', Colors.RED)}  {c('▄▄▄▄▄▄▄', Colors.DARK_RED)} {c('▄▄▄▄▄▄▄▄▄', Colors.RED)} {c('▄▄▄▄▄', Colors.DARK_RED)} {c('▄▄▄▄▄▄▄▄▄', Colors.RED)} {c('▄▄▄▄▄', Colors.DARK_RED)}   {c('▄▄▄▄', Colors.RED)}  	{c('│', Colors.DARK_RED)} {c('│  by @frameworkq', Colors.GRAY)}   {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}		      {c('│', Colors.DARK_RED)}	{c('│', Colors.DARK_RED)}        {c('███', Colors.RED)}      {c('███', Colors.DARK_RED)}  {c('███', Colors.RED)} {c('█████▀▀▀', Colors.DARK_RED)} {c('▀▀▀███▀▀▀', Colors.RED)}  {c('███', Colors.DARK_RED)}  {c('▀▀▀███▀▀▀', Colors.RED)}  {c('███', Colors.DARK_RED)}  {c('▄██▀▀██▄', Colors.RED)}	{c('│', Colors.DARK_RED)} {c('│  and @t1mott', Colors.GRAY)}      {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}		      {c('│', Colors.DARK_RED)}	{c('│', Colors.DARK_RED)}    	{c('███', Colors.RED)}      {c('███', Colors.DARK_RED)}  {c('███', Colors.RED)}  {c('▀████▄', Colors.DARK_RED)}     {c('███', Colors.RED)}     {c('███', Colors.DARK_RED)}     {c('███', Colors.RED)}     {c('███', Colors.DARK_RED)}  {c('███', Colors.RED)}  {c('███', Colors.DARK_RED)} 	{c('│', Colors.DARK_RED)} {c('│', Colors.DARK_RED)}                   {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}		      {c('│', Colors.DARK_RED)}	{c('│', Colors.DARK_RED)}    	 {c('███', Colors.RED)}      {c('███▄▄███', Colors.DARK_RED)}    {c('▀████', Colors.RED)}    {c('███', Colors.DARK_RED)}     {c('███', Colors.RED)}     {c('███', Colors.DARK_RED)}  {c('███▀▀███', Colors.RED)} 	{c('│', Colors.DARK_RED)} {c('│  DataBase - 41TB', Colors.GRAY)}  {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}		      {c('│', Colors.DARK_RED)}	{c('│', Colors.DARK_RED)}       {c('████████', Colors.RED)} {c('▀██████▀', Colors.DARK_RED)} {c('███████▀', Colors.RED)}    {c('███', Colors.DARK_RED)}    {c('▄███▄', Colors.RED)}    {c('███', Colors.DARK_RED)}    {c('▄███▄', Colors.RED)} {c('███', Colors.DARK_RED)}  {c('███', Colors.RED)}	{c('│', Colors.DARK_RED)} {c('│', Colors.DARK_RED)}                   {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}		      {c('│', Colors.DARK_RED)}	{c('│', Colors.DARK_RED)}    	{c('│', Colors.DARK_RED)} {c('│', Colors.DARK_RED)}	{c('│', Colors.DARK_RED)}    	{c('│', Colors.DARK_RED)} {c('│  version - 1.0', Colors.GRAY)}   {c('│', Colors.DARK_RED)}
-{c('╰───────────────────╯', Colors.DARK_RED)}	{c('╰───────────────────────────────────────────────────────────────────────────────╯', Colors.DARK_RED)} {c('╰───────────────────╯', Colors.DARK_RED)}	
+{c('╭───────────────────╮', Colors.DARK_RED)}\t{c('╭───────────────────────────────────────────────────────────────────────────────╮', Colors.DARK_RED)} {c('╭───────────────────╮', Colors.DARK_RED)}
+{c('│', Colors.DARK_RED)}\t\t      {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}    \t{c('▄▄▄', Colors.RED)}      {c('▄▄▄', Colors.DARK_RED)}  {c('▄▄▄', Colors.RED)}  {c('▄▄▄▄▄▄▄', Colors.DARK_RED)} {c('▄▄▄▄▄▄▄▄▄', Colors.RED)} {c('▄▄▄▄▄', Colors.DARK_RED)} {c('▄▄▄▄▄▄▄▄▄', Colors.RED)} {c('▄▄▄▄▄', Colors.DARK_RED)}   {c('▄▄▄▄', Colors.RED)}  \t{c('│', Colors.DARK_RED)} {c('│  by @frameworkq', Colors.GRAY)}   {c('│', Colors.DARK_RED)}
+{c('│', Colors.DARK_RED)}\t\t      {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}        {c('███', Colors.RED)}      {c('███', Colors.DARK_RED)}  {c('███', Colors.RED)} {c('█████▀▀▀', Colors.DARK_RED)} {c('▀▀▀███▀▀▀', Colors.RED)}  {c('███', Colors.DARK_RED)}  {c('▀▀▀███▀▀▀', Colors.RED)}  {c('███', Colors.DARK_RED)}  {c('▄██▀▀██▄', Colors.RED)}\t{c('│', Colors.DARK_RED)} {c('│  and @t1mott', Colors.GRAY)}      {c('│', Colors.DARK_RED)}
+{c('│', Colors.DARK_RED)}\t\t      {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}    \t{c('███', Colors.RED)}      {c('███', Colors.DARK_RED)}  {c('███', Colors.RED)}  {c('▀████▄', Colors.DARK_RED)}     {c('███', Colors.RED)}     {c('███', Colors.DARK_RED)}     {c('███', Colors.RED)}     {c('███', Colors.DARK_RED)}  {c('███', Colors.RED)}  {c('███', Colors.DARK_RED)} \t{c('│', Colors.DARK_RED)} {c('│', Colors.DARK_RED)}                   {c('│', Colors.DARK_RED)}
+{c('│', Colors.DARK_RED)}\t\t      {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}    \t {c('███', Colors.RED)}      {c('███▄▄███', Colors.DARK_RED)}    {c('▀████', Colors.RED)}    {c('███', Colors.DARK_RED)}     {c('███', Colors.RED)}     {c('███', Colors.DARK_RED)}  {c('███▀▀███', Colors.RED)} \t{c('│', Colors.DARK_RED)} {c('│  DataBase - 41TB', Colors.GRAY)}  {c('│', Colors.DARK_RED)}
+{c('│', Colors.DARK_RED)}\t\t      {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}       {c('████████', Colors.RED)} {c('▀██████▀', Colors.DARK_RED)} {c('███████▀', Colors.RED)}    {c('███', Colors.DARK_RED)}    {c('▄███▄', Colors.RED)}    {c('███', Colors.DARK_RED)}    {c('▄███▄', Colors.RED)} {c('███', Colors.DARK_RED)}  {c('███', Colors.RED)}\t{c('│', Colors.DARK_RED)} {c('│', Colors.DARK_RED)}                   {c('│', Colors.DARK_RED)}
+{c('│', Colors.DARK_RED)}\t\t      {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}    \t{c('│', Colors.DARK_RED)} {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}    \t{c('│', Colors.DARK_RED)} {c('│  version - 1.0', Colors.GRAY)}   {c('│', Colors.DARK_RED)}
+{c('╰───────────────────╯', Colors.DARK_RED)}\t{c('╰───────────────────────────────────────────────────────────────────────────────╯', Colors.DARK_RED)} {c('╰───────────────────╯', Colors.DARK_RED)}\t
 
 {c('╭───────────────────────────────────────────────────────╮', Colors.DARK_RED)}
 {c('│', Colors.DARK_RED)}  {c('[1]', Colors.RED)} - Поиск по ФИО      {c('│', Colors.DARK_RED)}  {c('[4]', Colors.RED)} - Поиск по ИНН        {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}  {c('[2]', Colors.RED)} - Поиск по номеру   {c('│', Colors.DARK_RED)}  {c('[5]', Colors.RED)} - Поиск по паспорту	{c('│', Colors.DARK_RED)}        
-{c('│', Colors.DARK_RED)}  {c('[3]', Colors.RED)} - Поиск по ном.авто {c('│', Colors.DARK_RED)}  {c('[6]', Colors.RED)} - Поиск по адресу	{c('│', Colors.DARK_RED)}
+{c('│', Colors.DARK_RED)}  {c('[2]', Colors.RED)} - Поиск по номеру   {c('│', Colors.DARK_RED)}  {c('[5]', Colors.RED)} - Поиск по паспорту\t{c('│', Colors.DARK_RED)}        
+{c('│', Colors.DARK_RED)}  {c('[3]', Colors.RED)} - Поиск по ном.авто {c('│', Colors.DARK_RED)}  {c('[6]', Colors.RED)} - Поиск по адресу\t{c('│', Colors.DARK_RED)}
 {c('╰───────────────────────────────────────────────────────╯', Colors.DARK_RED)}
 {c('╭───────────────────────────────────────────────────────╮', Colors.DARK_RED)}
 {c('│', Colors.DARK_RED)}  {c('[7]', Colors.RED)} - Поиск по почте    {c('│', Colors.DARK_RED)}  {c('[10]', Colors.RED)} - Скоро...           {c('│', Colors.DARK_RED)}
 {c('│', Colors.DARK_RED)}  {c('[8]', Colors.RED)} - Поиск по нику     {c('│', Colors.DARK_RED)}  {c('[11]', Colors.RED)} - Скоро...           {c('│', Colors.DARK_RED)}        
-{c('│', Colors.DARK_RED)}  {c('[9]', Colors.RED)} - Multisearch       {c('│', Colors.DARK_RED)}  {c('[12]', Colors.RED)} - Я боюсь нато	{c('│', Colors.DARK_RED)}
+{c('│', Colors.DARK_RED)}  {c('[9]', Colors.RED)} - Multisearch       {c('│', Colors.DARK_RED)}  {c('[12]', Colors.RED)} - Я боюсь нато\t{c('│', Colors.DARK_RED)}
 {c('│', Colors.DARK_RED)}  {c('[13]', Colors.RED)} - DB Uploader      {c('│', Colors.DARK_RED)}  {c('[14]', Colors.RED)} - Список баз         {c('│', Colors.DARK_RED)}
 {c('╰───────────────────────────────────────────────────────╯', Colors.DARK_RED)}
 """
@@ -119,9 +596,10 @@ def save_config(base_url: str, api_key: str):
 class DBClient:
     def __init__(self, base_url: str, api_key: str):
         self.base_url = base_url.rstrip("/")
-        self.headers = {"x-api-key": api_key}
+        self.headers = {"x-api-key": api_key} if api_key else {}
         self.session = requests.Session()
-        self.session.headers.update(self.headers)
+        if self.headers:
+            self.session.headers.update(self.headers)
 
     def _get(self, path: str, params=None, timeout=30) -> dict:
         url = f"{self.base_url}{path}"
@@ -135,7 +613,7 @@ class DBClient:
         r.raise_for_status()
         return r.json()
 
-    def _post(self, path: str, data=None, files=None, timeout=30) -> dict:
+    def _post(self, path: str, data=None, files=None, timeout=120) -> dict:
         url = f"{self.base_url}{path}"
         r = self.session.post(url, data=data, files=files, timeout=timeout)
         r.raise_for_status()
@@ -146,7 +624,6 @@ class DBClient:
         return data.get("databases", [])
 
     def get_database_info(self, name: str) -> dict:
-        """Получение информации о конкретной базе включая размер"""
         try:
             data = self._get(f"/databases/{requests.utils.quote(name, safe='')}")
             return data
@@ -171,10 +648,8 @@ class DBClient:
             raise
 
     def upload(self, filepath: Path, name: str = "") -> dict:
-        """Загрузка файла любого размера со стримингом и прогресс-баром."""
         file_size = filepath.stat().st_size
         upload_name = name or filepath.stem[:100]
-        url = f"{self.base_url}/upload"
 
         print()
         info(f"Файл:  {filepath.name}")
@@ -241,18 +716,15 @@ class DBClient:
 # ========================== УЛЬТРАБЫСТРЫЙ ПОИСК ==========================
 
 def search(query: str, limit: int = 1000) -> dict:
-    """Ультрабыстрый поиск с кешированием"""
     if not query.strip():
         return {"error": "Пустой запрос"}
 
-    # Проверка кеша
     cache_key = f"{query.lower().strip()}_{limit}"
     if cache_key in cache:
         cache_time, cache_data = cache[cache_key]
         if time.time() - cache_time < CACHE_TTL:
             return cache_data
 
-    headers = {"x-api-key": API_KEY}
     params = {"q": query, "limit": limit}
 
     start_time = time.time()
@@ -261,7 +733,6 @@ def search(query: str, limit: int = 1000) -> dict:
         resp = requests.get(
             f"{BASE_URL}/search",
             params=params,
-            headers=headers,
             timeout=30
         )
 
@@ -289,7 +760,6 @@ def search(query: str, limit: int = 1000) -> dict:
 # ========================== ПОИСК ВСЕХ ЗАПИСЕЙ ==========================
 
 def search_all(query: str, limit: int = 1000) -> dict:
-    """Поиск всех записей с автоматической пагинацией"""
     if not query.strip():
         return {"error": "Пустой запрос"}
     
@@ -298,7 +768,6 @@ def search_all(query: str, limit: int = 1000) -> dict:
     page_size = 1000
     total_count = None
     
-    headers = {"x-api-key": API_KEY}
     start_time = time.time()
     
     print(c("\n⏳ Начинаю поиск всех записей...", Colors.YELLOW))
@@ -314,7 +783,6 @@ def search_all(query: str, limit: int = 1000) -> dict:
             resp = requests.get(
                 f"{BASE_URL}/search",
                 params=params,
-                headers=headers,
                 timeout=60
             )
             
@@ -369,7 +837,6 @@ def search_all(query: str, limit: int = 1000) -> dict:
         return {"error": str(e), "tookMs": 0}
 
 def search_with_limit(query: str) -> dict:
-    """Поиск с выбором количества записей"""
     if not query.strip():
         return {"error": "Пустой запрос"}
     
@@ -398,7 +865,6 @@ def search_with_limit(query: str) -> dict:
 # ========================== JSON ВЫВОД ==========================
 
 def print_json(data, query):
-    """Красивый JSON вывод"""
     clear()
     
     print("\n" + c("═" * 70, Colors.BLOOD_RED + Colors.BOLD))
@@ -427,15 +893,13 @@ def print_json(data, query):
         print(c("═" * 70, Colors.BLOOD_RED + Colors.BOLD))
         return
     
-    # Если результатов много, спрашиваем, показывать ли все
     show_all_results = results
     if len(results) > 100:
-        show_all = input(c("\n[?] Показать все {len(results)} записей? (да/нет): ", Colors.YELLOW)).strip().lower()
+        show_all = input(c(f"\n[?] Показать все {len(results)} записей? (да/нет): ", Colors.YELLOW)).strip().lower()
         if show_all not in ['да', 'yes', 'y', 'д']:
             print(c("\n📋 Показаны первые 100 записей", Colors.CYAN))
             show_all_results = results[:100]
     
-    # JSON вывод
     print(c("\n📋 JSON:", Colors.CYAN))
     
     if len(results) > 500:
@@ -445,7 +909,6 @@ def print_json(data, query):
         display_data["results"] = show_all_results
         print(json.dumps(display_data, indent=2, ensure_ascii=False))
     
-    # Таблица с результатами
     print(c("\n" + "═" * 70, Colors.GRAY))
     print(c(f"  📊 ЗАПИСИ", Colors.GREEN))
     print(c("═" * 70, Colors.GRAY))
@@ -537,10 +1000,8 @@ def multisearch():
 # ========================== DB UPLOADER ФУНКЦИИ ==========================
 
 def get_files_bulk(path_input: str) -> list:
-    """Получение всех файлов из папки или по шаблону"""
     files = []
     
-    # Если это папка
     if os.path.isdir(path_input):
         dir_path = Path(path_input)
         for f in dir_path.iterdir():
@@ -548,7 +1009,6 @@ def get_files_bulk(path_input: str) -> list:
                 files.append(f)
         return files
     
-    # Если это шаблон с *
     if '*' in path_input or '?' in path_input:
         for pattern_path in glob.glob(path_input):
             p = Path(pattern_path)
@@ -556,7 +1016,6 @@ def get_files_bulk(path_input: str) -> list:
                 files.append(p)
         return files
     
-    # Если это конкретный файл
     p = Path(path_input)
     if p.exists() and p.is_file() and p.suffix.lower() in SUPPORTED:
         return [p]
@@ -566,11 +1025,10 @@ def get_files_bulk(path_input: str) -> list:
 def db_uploader():
     cfg = load_config()
     
-    if not cfg["base_url"] or not cfg["api_key"]:
+    if not cfg["base_url"]:
         cfg["base_url"] = BASE_URL
-        cfg["api_key"] = API_KEY
     
-    client = DBClient(cfg["base_url"], cfg["api_key"])
+    client = DBClient(cfg["base_url"], cfg.get("api_key", ""))
     
     clear()
     print("\n" + c("═" * 70, Colors.BLOOD_RED + Colors.BOLD))
@@ -590,7 +1048,6 @@ def db_uploader():
         input(c("\n[+] Нажмите Enter...", Colors.GRAY))
         return
     
-    # Получаем файлы
     files = get_files_bulk(path_input)
     
     if not files:
@@ -598,7 +1055,6 @@ def db_uploader():
         input(c("\n[+] Нажмите Enter...", Colors.GRAY))
         return
     
-    # Показываем найденные файлы
     print(c(f"\n📁 Найдено файлов: {len(files)}", Colors.GREEN))
     for f in files[:10]:
         size = fmt_size(f.stat().st_size)
@@ -615,7 +1071,6 @@ def db_uploader():
         input(c("\n[+] Нажмите Enter...", Colors.GRAY))
         return
     
-    # Пакетная загрузка
     print()
     hr()
     print(c("  ⏳ ЗАГРУЗКА {} ФАЙЛОВ...".format(len(files)), Colors.RED + Colors.BOLD))
@@ -630,7 +1085,6 @@ def db_uploader():
         print()
         print(c(f"[{i}/{len(files)}] {filepath.name}", Colors.CYAN + Colors.BOLD))
         
-        # Название базы = имя файла (без расширения)
         db_name = filepath.stem[:100]
         
         result = client.upload(filepath, db_name)
@@ -647,7 +1101,6 @@ def db_uploader():
             print(c(f"  ❌ {error}", Colors.RED))
             failed.append(filepath.name)
     
-    # Итог
     print()
     hr()
     print(c("  📊 ИТОГ ПАКЕТНОЙ ЗАГРУЗКИ", Colors.RED + Colors.BOLD))
@@ -665,11 +1118,10 @@ def db_uploader():
 
 def db_list():
     cfg = load_config()
-    if not cfg["base_url"] or not cfg["api_key"]:
+    if not cfg["base_url"]:
         cfg["base_url"] = BASE_URL
-        cfg["api_key"] = API_KEY
     
-    client = DBClient(cfg["base_url"], cfg["api_key"])
+    client = DBClient(cfg["base_url"], cfg.get("api_key", ""))
     
     clear()
     print("\n" + c("═" * 70, Colors.BLOOD_RED + Colors.BOLD))
@@ -694,7 +1146,6 @@ def db_list():
             cols = db.get("columns", [])
             row_count = db.get("rowCount", 0)
             
-            # Получаем размер базы
             db_size = 0
             try:
                 db_info = client.get_database_info(db_name)
@@ -733,6 +1184,16 @@ def db_list():
 # ========================== ОСНОВНАЯ ФУНКЦИЯ ==========================
 
 def main():
+    # Автозапуск сервера в фоне
+    print(c("\n⏳ Запуск API сервера...", Colors.YELLOW))
+    if ensure_server():
+        print(c("✅ Сервер запущен на " + BASE_URL, Colors.GREEN))
+    else:
+        print(c("❌ Не удалось запустить сервер!", Colors.RED))
+        print(c("   Установи зависимости: pip install fastapi uvicorn python-multipart openpyxl", Colors.GRAY))
+        sys.exit(1)
+    time.sleep(0.5)
+
     labels = {
         '1': 'ФИО', '2': 'номер телефона', '3': 'номер автомобиля',
         '4': 'ИНН', '5': 'паспорт', '6': 'адрес', '7': 'почту', '8': 'никнейм'
