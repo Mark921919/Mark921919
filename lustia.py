@@ -1166,15 +1166,10 @@ def db_list():
 # ========================== ОСНОВНАЯ ФУНКЦИЯ ==========================
 
 def main():
-    # Автозапуск сервера в фоне
-    print(c("\n⏳ Запуск API сервера...", Colors.YELLOW))
-    if ensure_server():
-        print(c("✅ Сервер запущен на " + BASE_URL, Colors.GREEN))
-    else:
+    if not ensure_server():
         print(c("❌ Не удалось запустить сервер!", Colors.RED))
-        print(c("   Установи зависимости: pip install fastapi uvicorn python-multipart openpyxl", Colors.GRAY))
+        print(c("   pip install fastapi uvicorn python-multipart openpyxl", Colors.GRAY))
         sys.exit(1)
-    time.sleep(0.5)
 
     labels = {
         '1': 'ФИО', '2': 'номер телефона', '3': 'номер автомобиля',
