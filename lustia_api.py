@@ -1,4 +1,4 @@
-"""Lustia API Search — загрузка баз данных любого формата и полнотекстовый поиск за <1 секунду.
+"""Lustia API Search — сервер для загрузки баз данных любого формата и полнотекстового поиска.
 
 Поддерживаемые форматы: CSV, TSV, JSON, XML, Excel (.xlsx/.xls), TXT
 
@@ -20,8 +20,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import APIRouter, FastAPI, HTTPException, Query, UploadFile
+from fastapi import FastAPI, APIRouter, Form, HTTPException, Query, UploadFile
 from openpyxl import load_workbook
+
 
 # ──────────────────────────────────────────────
 # DATABASE (SQLite + FTS5)
@@ -84,7 +85,7 @@ def get_database_entry(name: str) -> dict | None:
     return dict(row) if row else None
 
 
-def list_databases() -> list[dict]:
+def list_databases_db() -> list[dict]:
     conn = _get_conn()
     rows = conn.execute("SELECT * FROM databases ORDER BY id").fetchall()
     return [dict(r) for r in rows]
@@ -107,34 +108,83 @@ def insert_records(db_id: int, rows: list[str]) -> int:
     return len(rows)
 
 
-def search_records(query: str, limit: int = 50, db_name: str | None = None) -> list[dict]:
+def get_columns(db_id: int) -> list[str]:
+    """Extract column names from the first record of a database."""
     conn = _get_conn()
+    row = conn.execute(
+        "SELECT row_data FROM records WHERE db_id = ? LIMIT 1", (db_id,)
+    ).fetchone()
+    if not row:
+        return []
+    parts = row["row_data"].split(" | ")
+    cols = []
+    for p in parts:
+        if ": " in p:
+            cols.append(p.split(": ", 1)[0])
+    return cols
+
+
+def search_records(
+    query: str, limit: int = 50, offset: int = 0, db_name: str | None = None
+) -> tuple[list[dict], int]:
+    conn = _get_conn()
+
+    # Count total matches
     if db_name:
+        count_sql = """
+            SELECT COUNT(*) AS cnt
+            FROM records_fts fts
+            JOIN records r ON r.id = fts.rowid
+            JOIN databases d ON d.id = r.db_id
+            WHERE fts.row_data MATCH ? AND d.name = ?
+        """
+        total = conn.execute(count_sql, (query, db_name)).fetchone()["cnt"]
         sql = """
             SELECT r.id, d.name AS db_name, r.row_data, rank
             FROM records_fts fts
             JOIN records r ON r.id = fts.rowid
             JOIN databases d ON d.id = r.db_id
             WHERE fts.row_data MATCH ? AND d.name = ?
-            ORDER BY rank LIMIT ?
+            ORDER BY rank LIMIT ? OFFSET ?
         """
-        rows = conn.execute(sql, (query, db_name, limit)).fetchall()
+        rows = conn.execute(sql, (query, db_name, limit, offset)).fetchall()
     else:
+        count_sql = """
+            SELECT COUNT(*) AS cnt
+            FROM records_fts fts
+            JOIN records r ON r.id = fts.rowid
+            WHERE fts.row_data MATCH ?
+        """
+        total = conn.execute(count_sql, (query,)).fetchone()["cnt"]
         sql = """
             SELECT r.id, d.name AS db_name, r.row_data, rank
             FROM records_fts fts
             JOIN records r ON r.id = fts.rowid
             JOIN databases d ON d.id = r.db_id
             WHERE fts.row_data MATCH ?
-            ORDER BY rank LIMIT ?
+            ORDER BY rank LIMIT ? OFFSET ?
         """
-        rows = conn.execute(sql, (query, limit)).fetchall()
-    return [dict(r) for r in rows]
+        rows = conn.execute(sql, (query, limit, offset)).fetchall()
+
+    results = []
+    for r in rows:
+        item: dict = {"database": r["db_name"]}
+        for part in r["row_data"].split(" | "):
+            if ": " in part:
+                k, v = part.split(": ", 1)
+                item[k] = v
+            else:
+                item["data"] = part
+        results.append(item)
+
+    return results, total
 
 
 def count_records(db_id: int) -> int:
     conn = _get_conn()
-    row = conn.execute("SELECT COUNT(*) AS cnt FROM records WHERE db_id = ?", (db_id,)).fetchone()
+    row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM records WHERE db_id = ?", (db_id,)
+    ).fetchone()
     return row["cnt"]
 
 
@@ -146,7 +196,6 @@ _ENCODINGS = ["utf-8", "utf-8-sig", "cp1251", "latin-1"]
 
 
 def _decode(content: bytes) -> str:
-    """Decode bytes trying multiple encodings (UTF-8 → CP1251 → Latin-1)."""
     for enc in _ENCODINGS:
         try:
             return content.decode(enc)
@@ -155,7 +204,7 @@ def _decode(content: bytes) -> str:
     return content.decode("latin-1")
 
 
-def parse_csv(content: bytes, encoding: str = "utf-8") -> list[str]:
+def parse_csv(content: bytes) -> list[str]:
     text = _decode(content)
     reader = csv.DictReader(io.StringIO(text))
     rows = []
@@ -166,7 +215,7 @@ def parse_csv(content: bytes, encoding: str = "utf-8") -> list[str]:
     return rows
 
 
-def parse_tsv(content: bytes, encoding: str = "utf-8") -> list[str]:
+def parse_tsv(content: bytes) -> list[str]:
     text = _decode(content)
     reader = csv.DictReader(io.StringIO(text), delimiter="\t")
     rows = []
@@ -177,7 +226,7 @@ def parse_tsv(content: bytes, encoding: str = "utf-8") -> list[str]:
     return rows
 
 
-def parse_json(content: bytes, encoding: str = "utf-8") -> list[str]:
+def parse_json(content: bytes) -> list[str]:
     text = _decode(content)
     data = json.loads(text)
     if isinstance(data, list):
@@ -189,7 +238,9 @@ def parse_json(content: bytes, encoding: str = "utf-8") -> list[str]:
     rows = []
     for item in items:
         if isinstance(item, dict):
-            row_text = " | ".join(f"{k}: {v}" for k, v in item.items() if v is not None)
+            row_text = " | ".join(
+                f"{k}: {v}" for k, v in item.items() if v is not None
+            )
         else:
             row_text = str(item)
         if row_text:
@@ -225,7 +276,10 @@ def parse_excel(content: bytes) -> list[str]:
         sheet_rows = list(ws.iter_rows(values_only=True))
         if not sheet_rows:
             continue
-        headers = [str(h) if h is not None else f"col_{i}" for i, h in enumerate(sheet_rows[0])]
+        headers = [
+            str(h) if h is not None else f"col_{i}"
+            for i, h in enumerate(sheet_rows[0])
+        ]
         for data_row in sheet_rows[1:]:
             parts = []
             for header, val in zip(headers, data_row):
@@ -237,7 +291,7 @@ def parse_excel(content: bytes) -> list[str]:
     return rows
 
 
-def parse_txt(content: bytes, encoding: str = "utf-8") -> list[str]:
+def parse_txt(content: bytes) -> list[str]:
     text = _decode(content)
     rows = []
     for line in text.splitlines():
@@ -283,31 +337,50 @@ def parse_file(filename: str, content: bytes) -> list[str]:
 router = APIRouter()
 
 
-@router.post("/databases/upload")
-async def upload_database(file: UploadFile, db_name: str = Query(..., min_length=1)):
-    """Загрузить файл как новую базу данных (CSV, TSV, JSON, XML, Excel, TXT)."""
+@router.post("/upload")
+async def upload_database(file: UploadFile, name: str = Form(...)):
+    """Загрузить файл как новую базу данных."""
     start = time.perf_counter()
+
     if not file.filename:
         raise HTTPException(status_code=400, detail="File has no name")
+
+    db_name = name.strip()[:100]
+    if not db_name:
+        raise HTTPException(status_code=400, detail="Empty database name")
+
     existing = get_database_entry(db_name)
     if existing:
-        raise HTTPException(status_code=409, detail=f"Database '{db_name}' already exists")
+        raise HTTPException(
+            status_code=409, detail=f"Database '{db_name}' already exists"
+        )
+
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
+
     try:
         rows = parse_file(file.filename, content)
     except (ValueError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
     if not rows:
         raise HTTPException(status_code=400, detail="File contains no records")
+
     db_id = create_database_entry(db_name)
     inserted = insert_records(db_id, rows)
     elapsed = time.perf_counter() - start
+
+    columns = get_columns(db_id)
+
     return {
-        "status": "ok",
-        "db_name": db_name,
-        "records_inserted": inserted,
+        "ok": True,
+        "database": {
+            "name": db_name,
+            "rowCount": inserted,
+            "columns": columns,
+            "createdAt": get_database_entry(db_name)["created_at"],
+        },
         "elapsed_seconds": round(elapsed, 4),
     }
 
@@ -315,12 +388,38 @@ async def upload_database(file: UploadFile, db_name: str = Query(..., min_length
 @router.get("/databases")
 async def list_all_databases():
     """Список всех загруженных баз данных."""
-    dbs = list_databases()
+    dbs = list_databases_db()
     result = []
     for db in dbs:
         cnt = count_records(db["id"])
-        result.append({**db, "record_count": cnt})
+        columns = get_columns(db["id"])
+        result.append(
+            {
+                "name": db["name"],
+                "rowCount": cnt,
+                "columns": columns,
+                "createdAt": db["created_at"],
+            }
+        )
     return {"databases": result}
+
+
+@router.get("/databases/{db_name}")
+async def get_database_info(db_name: str):
+    """Информация о конкретной базе данных."""
+    entry = get_database_entry(db_name)
+    if not entry:
+        raise HTTPException(
+            status_code=404, detail=f"Database '{db_name}' not found"
+        )
+    cnt = count_records(entry["id"])
+    columns = get_columns(entry["id"])
+    return {
+        "name": entry["name"],
+        "rowCount": cnt,
+        "columns": columns,
+        "createdAt": entry["created_at"],
+    }
 
 
 @router.delete("/databases/{db_name}")
@@ -328,9 +427,11 @@ async def delete_database(db_name: str):
     """Удалить базу данных и все её записи."""
     entry = get_database_entry(db_name)
     if not entry:
-        raise HTTPException(status_code=404, detail=f"Database '{db_name}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Database '{db_name}' not found"
+        )
     delete_database_entry(entry["id"])
-    return {"status": "deleted", "db_name": db_name}
+    return {"ok": True, "deleted": db_name}
 
 
 @router.get("/formats")
@@ -340,28 +441,37 @@ async def supported_formats():
 
 
 @router.get("/search")
-async def search(
+async def search_endpoint(
     q: str = Query(..., min_length=1, description="Search query"),
-    db_name: str | None = Query(None, description="Limit to specific database"),
-    limit: int = Query(50, ge=1, le=500),
+    db: str | None = Query(None, description="Limit to specific database"),
+    limit: int = Query(100, ge=1, le=10000),
+    offset: int = Query(0, ge=0),
 ):
-    """Полнотекстовый поиск по всем базам данных (или по конкретной)."""
+    """Полнотекстовый поиск по всем базам данных."""
     start = time.perf_counter()
-    if db_name:
-        entry = get_database_entry(db_name)
+
+    if db:
+        entry = get_database_entry(db)
         if not entry:
-            raise HTTPException(status_code=404, detail=f"Database '{db_name}' not found")
+            raise HTTPException(
+                status_code=404, detail=f"Database '{db}' not found"
+            )
+
     try:
-        results = search_records(q, limit=limit, db_name=db_name)
+        results, total_count = search_records(
+            q, limit=limit, offset=offset, db_name=db
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Search error: {exc}")
-    elapsed = time.perf_counter() - start
+
+    elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+
     return {
-        "query": q,
-        "db_name": db_name,
-        "count": len(results),
-        "elapsed_seconds": round(elapsed, 4),
+        "ok": True,
         "results": results,
+        "count": total_count,
+        "totalCount": total_count,
+        "tookMs": elapsed_ms,
     }
 
 
@@ -379,11 +489,11 @@ async def lifespan(a: FastAPI):
 app = FastAPI(
     title="Lustia API Search",
     description="Lustia API — загрузка и поиск по базам данных любого формата за <1 секунду",
-    version="0.2.0",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
-app.include_router(router, prefix="/lustia/api/search")
+app.include_router(router, prefix="/api")
 
 
 @app.get("/health")
