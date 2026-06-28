@@ -19,10 +19,9 @@ import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, APIRouter, HTTPException, Query, UploadFile
-from openpyxl import load_workbook
 import uvicorn
-
+from fastapi import APIRouter, FastAPI, HTTPException, Query, UploadFile
+from openpyxl import load_workbook
 
 # ──────────────────────────────────────────────
 # DATABASE (SQLite + FTS5)
@@ -143,8 +142,21 @@ def count_records(db_id: int) -> int:
 # PARSER (все форматы)
 # ──────────────────────────────────────────────
 
+_ENCODINGS = ["utf-8", "utf-8-sig", "cp1251", "latin-1"]
+
+
+def _decode(content: bytes) -> str:
+    """Decode bytes trying multiple encodings (UTF-8 → CP1251 → Latin-1)."""
+    for enc in _ENCODINGS:
+        try:
+            return content.decode(enc)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return content.decode("latin-1")
+
+
 def parse_csv(content: bytes, encoding: str = "utf-8") -> list[str]:
-    text = content.decode(encoding)
+    text = _decode(content)
     reader = csv.DictReader(io.StringIO(text))
     rows = []
     for record in reader:
@@ -155,7 +167,7 @@ def parse_csv(content: bytes, encoding: str = "utf-8") -> list[str]:
 
 
 def parse_tsv(content: bytes, encoding: str = "utf-8") -> list[str]:
-    text = content.decode(encoding)
+    text = _decode(content)
     reader = csv.DictReader(io.StringIO(text), delimiter="\t")
     rows = []
     for record in reader:
@@ -166,7 +178,7 @@ def parse_tsv(content: bytes, encoding: str = "utf-8") -> list[str]:
 
 
 def parse_json(content: bytes, encoding: str = "utf-8") -> list[str]:
-    text = content.decode(encoding)
+    text = _decode(content)
     data = json.loads(text)
     if isinstance(data, list):
         items = data
@@ -226,7 +238,7 @@ def parse_excel(content: bytes) -> list[str]:
 
 
 def parse_txt(content: bytes, encoding: str = "utf-8") -> list[str]:
-    text = content.decode(encoding)
+    text = _decode(content)
     rows = []
     for line in text.splitlines():
         stripped = line.strip()
@@ -236,8 +248,13 @@ def parse_txt(content: bytes, encoding: str = "utf-8") -> list[str]:
 
 
 SUPPORTED_EXTENSIONS = {
-    ".csv": "CSV", ".tsv": "TSV", ".json": "JSON",
-    ".xml": "XML", ".xlsx": "Excel", ".xls": "Excel", ".txt": "Text",
+    ".csv": "CSV",
+    ".tsv": "TSV",
+    ".json": "JSON",
+    ".xml": "XML",
+    ".xlsx": "Excel",
+    ".xls": "Excel",
+    ".txt": "Text",
 }
 
 
@@ -280,7 +297,7 @@ async def upload_database(file: UploadFile, db_name: str = Query(..., min_length
         raise HTTPException(status_code=400, detail="Empty file")
     try:
         rows = parse_file(file.filename, content)
-    except ValueError as exc:
+    except (ValueError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if not rows:
         raise HTTPException(status_code=400, detail="File contains no records")
@@ -351,6 +368,7 @@ async def search(
 # ──────────────────────────────────────────────
 # APP
 # ──────────────────────────────────────────────
+
 
 @asynccontextmanager
 async def lifespan(a: FastAPI):

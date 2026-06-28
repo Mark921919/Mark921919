@@ -10,9 +10,21 @@ import xml.etree.ElementTree as ET
 
 from openpyxl import load_workbook
 
+_ENCODINGS = ["utf-8", "utf-8-sig", "cp1251", "latin-1"]
+
+
+def _decode(content: bytes) -> str:
+    """Decode bytes trying multiple encodings (UTF-8 → CP1251 → Latin-1)."""
+    for enc in _ENCODINGS:
+        try:
+            return content.decode(enc)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return content.decode("latin-1")
+
 
 def parse_csv(content: bytes, encoding: str = "utf-8") -> list[str]:
-    text = content.decode(encoding)
+    text = _decode(content)
     reader = csv.DictReader(io.StringIO(text))
     rows: list[str] = []
     for record in reader:
@@ -23,7 +35,7 @@ def parse_csv(content: bytes, encoding: str = "utf-8") -> list[str]:
 
 
 def parse_tsv(content: bytes, encoding: str = "utf-8") -> list[str]:
-    text = content.decode(encoding)
+    text = _decode(content)
     reader = csv.DictReader(io.StringIO(text), delimiter="\t")
     rows: list[str] = []
     for record in reader:
@@ -34,7 +46,7 @@ def parse_tsv(content: bytes, encoding: str = "utf-8") -> list[str]:
 
 
 def parse_json(content: bytes, encoding: str = "utf-8") -> list[str]:
-    text = content.decode(encoding)
+    text = _decode(content)
     data = json.loads(text)
 
     if isinstance(data, list):
@@ -96,7 +108,7 @@ def parse_excel(content: bytes) -> list[str]:
 
 
 def parse_txt(content: bytes, encoding: str = "utf-8") -> list[str]:
-    text = content.decode(encoding)
+    text = _decode(content)
     rows: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()

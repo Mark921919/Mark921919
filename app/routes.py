@@ -36,7 +36,7 @@ async def upload_database(file: UploadFile, db_name: str = Query(..., min_length
 
     try:
         rows = parse_file(file.filename, content)
-    except ValueError as exc:
+    except (ValueError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
     if not rows:
