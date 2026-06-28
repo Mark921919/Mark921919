@@ -13,14 +13,14 @@ from app.database import (
     list_databases,
     search_records,
 )
-from app.parser import parse_file
+from app.parser import SUPPORTED_EXTENSIONS, parse_file
 
 router = APIRouter()
 
 
 @router.post("/databases/upload")
 async def upload_database(file: UploadFile, db_name: str = Query(..., min_length=1)):
-    """Upload a CSV or JSON file as a new searchable database."""
+    """Upload a file as a new searchable database (CSV, TSV, JSON, XML, Excel, TXT)."""
     start = time.perf_counter()
 
     if not file.filename:
@@ -73,6 +73,12 @@ async def delete_database(db_name: str):
         raise HTTPException(status_code=404, detail=f"Database '{db_name}' not found")
     delete_database_entry(entry["id"])
     return {"status": "deleted", "db_name": db_name}
+
+
+@router.get("/formats")
+async def supported_formats():
+    """List all supported file formats for upload."""
+    return {"formats": SUPPORTED_EXTENSIONS}
 
 
 @router.get("/search")

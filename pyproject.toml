@@ -1,13 +1,14 @@
 [project]
-name = "db-search-api"
-version = "0.1.0"
-description = "Fast API for uploading and searching databases (<1s)"
+name = "lustia-api-search"
+version = "0.2.0"
+description = "Lustia API for uploading and searching databases of any format (<1s)"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.111.0,<0.116",
     "uvicorn>=0.30.0,<0.35",
     "python-multipart>=0.0.9,<0.1",
     "aiofiles>=24.1.0,<25",
+    "openpyxl>=3.1.0,<4",
 ]
 
 [project.optional-dependencies]

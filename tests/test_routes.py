@@ -77,11 +77,69 @@ class TestUploadEndpoint:
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_upload_xml(self, client):
+        xml_data = b"<root><item><name>Alice</name></item></root>"
+        resp = await client.post(
+            "/lustia/api/search/databases/upload",
+            params={"db_name": "xml_db"},
+            files={"file": ("data.xml", io.BytesIO(xml_data), "text/xml")},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["records_inserted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_upload_tsv(self, client):
+        tsv_data = b"name\tage\nAlice\t30\n"
+        resp = await client.post(
+            "/lustia/api/search/databases/upload",
+            params={"db_name": "tsv_db"},
+            files={"file": ("data.tsv", io.BytesIO(tsv_data), "text/tab-separated-values")},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["records_inserted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_upload_txt(self, client):
+        txt_data = b"line one\nline two\n"
+        resp = await client.post(
+            "/lustia/api/search/databases/upload",
+            params={"db_name": "txt_db"},
+            files={"file": ("data.txt", io.BytesIO(txt_data), "text/plain")},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["records_inserted"] == 2
+
+    @pytest.mark.asyncio
+    async def test_upload_xlsx(self, client):
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["name", "age"])
+        ws.append(["Alice", 30])
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        resp = await client.post(
+            "/lustia/api/search/databases/upload",
+            params={"db_name": "excel_db"},
+            files={
+                "file": (
+                    "data.xlsx",
+                    buf,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["records_inserted"] == 1
+
+    @pytest.mark.asyncio
     async def test_upload_unsupported_type(self, client):
         resp = await client.post(
             "/lustia/api/search/databases/upload",
             params={"db_name": "bad"},
-            files={"file": ("data.xml", io.BytesIO(b"<xml/>"), "text/xml")},
+            files={"file": ("data.pdf", io.BytesIO(b"content"), "application/pdf")},
         )
         assert resp.status_code == 400
 
@@ -125,6 +183,20 @@ class TestDeleteEndpoint:
     async def test_delete_nonexistent(self, client):
         resp = await client.delete("/lustia/api/search/databases/nope")
         assert resp.status_code == 404
+
+
+class TestFormatsEndpoint:
+    @pytest.mark.asyncio
+    async def test_formats(self, client):
+        resp = await client.get("/lustia/api/search/formats")
+        assert resp.status_code == 200
+        formats = resp.json()["formats"]
+        assert ".csv" in formats
+        assert ".json" in formats
+        assert ".xml" in formats
+        assert ".xlsx" in formats
+        assert ".tsv" in formats
+        assert ".txt" in formats
 
 
 class TestSearchEndpoint:
