@@ -571,27 +571,29 @@ def fmt_size(n: int) -> str:
 
 # ========================== БАННЕР ==========================
 
-BANNER = f"""
-{c('╭───────────────────╮', Colors.DARK_RED)}\t{c('╭───────────────────────────────────────────────────────────────────────────────╮', Colors.DARK_RED)} {c('╭───────────────────╮', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}\t\t      {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}    \t{c('▄▄▄', Colors.RED)}      {c('▄▄▄', Colors.DARK_RED)}  {c('▄▄▄', Colors.RED)}  {c('▄▄▄▄▄▄▄', Colors.DARK_RED)} {c('▄▄▄▄▄▄▄▄▄', Colors.RED)} {c('▄▄▄▄▄', Colors.DARK_RED)} {c('▄▄▄▄▄▄▄▄▄', Colors.RED)} {c('▄▄▄▄▄', Colors.DARK_RED)}   {c('▄▄▄▄', Colors.RED)}  \t{c('│', Colors.DARK_RED)} {c('│  by @frameworkq', Colors.GRAY)}   {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}\t\t      {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}        {c('███', Colors.RED)}      {c('███', Colors.DARK_RED)}  {c('███', Colors.RED)} {c('█████▀▀▀', Colors.DARK_RED)} {c('▀▀▀███▀▀▀', Colors.RED)}  {c('███', Colors.DARK_RED)}  {c('▀▀▀███▀▀▀', Colors.RED)}  {c('███', Colors.DARK_RED)}  {c('▄██▀▀██▄', Colors.RED)}\t{c('│', Colors.DARK_RED)} {c('│  and @t1mott', Colors.GRAY)}      {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}\t\t      {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}    \t{c('███', Colors.RED)}      {c('███', Colors.DARK_RED)}  {c('███', Colors.RED)}  {c('▀████▄', Colors.DARK_RED)}     {c('███', Colors.RED)}     {c('███', Colors.DARK_RED)}     {c('███', Colors.RED)}     {c('███', Colors.DARK_RED)}  {c('███', Colors.RED)}  {c('███', Colors.DARK_RED)} \t{c('│', Colors.DARK_RED)} {c('│', Colors.DARK_RED)}                   {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}\t\t      {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}    \t {c('███', Colors.RED)}      {c('███▄▄███', Colors.DARK_RED)}    {c('▀████', Colors.RED)}    {c('███', Colors.DARK_RED)}     {c('███', Colors.RED)}     {c('███', Colors.DARK_RED)}  {c('███▀▀███', Colors.RED)} \t{c('│', Colors.DARK_RED)} {c('│  DataBase - 41TB', Colors.GRAY)}  {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}\t\t      {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}       {c('████████', Colors.RED)} {c('▀██████▀', Colors.DARK_RED)} {c('███████▀', Colors.RED)}    {c('███', Colors.DARK_RED)}    {c('▄███▄', Colors.RED)}    {c('███', Colors.DARK_RED)}    {c('▄███▄', Colors.RED)} {c('███', Colors.DARK_RED)}  {c('███', Colors.RED)}\t{c('│', Colors.DARK_RED)} {c('│', Colors.DARK_RED)}                   {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}\t\t      {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}    \t{c('│', Colors.DARK_RED)} {c('│', Colors.DARK_RED)}\t{c('│', Colors.DARK_RED)}    \t{c('│', Colors.DARK_RED)} {c('│  version - 1.0', Colors.GRAY)}   {c('│', Colors.DARK_RED)}
-{c('╰───────────────────╯', Colors.DARK_RED)}\t{c('╰───────────────────────────────────────────────────────────────────────────────╯', Colors.DARK_RED)} {c('╰───────────────────╯', Colors.DARK_RED)}\t
+R = Colors.RED
+D = Colors.DARK_RED
+G = Colors.GRAY
 
-{c('╭───────────────────────────────────────────────────────╮', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}  {c('[1]', Colors.RED)} - Поиск по ФИО      {c('│', Colors.DARK_RED)}  {c('[4]', Colors.RED)} - Поиск по ИНН        {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}  {c('[2]', Colors.RED)} - Поиск по номеру   {c('│', Colors.DARK_RED)}  {c('[5]', Colors.RED)} - Поиск по паспорту\t{c('│', Colors.DARK_RED)}        
-{c('│', Colors.DARK_RED)}  {c('[3]', Colors.RED)} - Поиск по ном.авто {c('│', Colors.DARK_RED)}  {c('[6]', Colors.RED)} - Поиск по адресу\t{c('│', Colors.DARK_RED)}
-{c('╰───────────────────────────────────────────────────────╯', Colors.DARK_RED)}
-{c('╭───────────────────────────────────────────────────────╮', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}  {c('[7]', Colors.RED)} - Поиск по почте    {c('│', Colors.DARK_RED)}  {c('[10]', Colors.RED)} - Скоро...           {c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}  {c('[8]', Colors.RED)} - Поиск по нику     {c('│', Colors.DARK_RED)}  {c('[11]', Colors.RED)} - Скоро...           {c('│', Colors.DARK_RED)}        
-{c('│', Colors.DARK_RED)}  {c('[9]', Colors.RED)} - Multisearch       {c('│', Colors.DARK_RED)}  {c('[12]', Colors.RED)} - Я боюсь нато\t{c('│', Colors.DARK_RED)}
-{c('│', Colors.DARK_RED)}  {c('[13]', Colors.RED)} - DB Uploader      {c('│', Colors.DARK_RED)}  {c('[14]', Colors.RED)} - Список баз         {c('│', Colors.DARK_RED)}
-{c('╰───────────────────────────────────────────────────────╯', Colors.DARK_RED)}
+BANNER = f"""
+    {c('██', R)}        {c('██    ██', R)}   {c('███████', R)}  {c('████████', R)}  {c('██', R)}  {c('████████', R)}    {c('████', R)}
+    {c('██', R)}        {c('██    ██', R)}  {c('██', R)}           {c('██', R)}     {c('██', R)}     {c('██', R)}      {c('██  ██', R)}       {c('by @frameworkq', G)}
+    {c('██', R)}        {c('██    ██', R)}   {c('███████', R)}     {c('██', R)}     {c('██', R)}     {c('██', R)}     {c('██    ██', R)}      {c('and @t1mott', G)}
+    {c('██', D)}        {c('██    ██', D)}        {c('██', D)}     {c('██', D)}     {c('██', D)}     {c('██', D)}     {c('████████', D)}
+    {c('██', D)}        {c('██    ██', D)}        {c('██', D)}     {c('██', D)}     {c('██', D)}     {c('██', D)}     {c('██    ██', D)}      {c('DataBase - 41TB', G)}
+    {c('████████', D)}   {c('██████', D)}    {c('███████', D)}     {c('██', D)}     {c('██', D)}     {c('██', D)}     {c('██    ██', D)}      {c('version - 1.0', G)}
+
+{c('╭───────────────────────────────────────────────────────╮', D)}
+{c('│', D)}  {c('[1]', R)} - Поиск по ФИО      {c('│', D)}  {c('[4]', R)} - Поиск по ИНН        {c('│', D)}
+{c('│', D)}  {c('[2]', R)} - Поиск по номеру   {c('│', D)}  {c('[5]', R)} - Поиск по паспорту   {c('│', D)}
+{c('│', D)}  {c('[3]', R)} - Поиск по ном.авто {c('│', D)}  {c('[6]', R)} - Поиск по адресу     {c('│', D)}
+{c('╰───────────────────────────────────────────────────────╯', D)}
+{c('╭───────────────────────────────────────────────────────╮', D)}
+{c('│', D)}  {c('[7]', R)} - Поиск по почте    {c('│', D)}  {c('[10]', R)} - Скоро...           {c('│', D)}
+{c('│', D)}  {c('[8]', R)} - Поиск по нику     {c('│', D)}  {c('[11]', R)} - Скоро...           {c('│', D)}
+{c('│', D)}  {c('[9]', R)} - Multisearch       {c('│', D)}  {c('[12]', R)} - Я боюсь нато       {c('│', D)}
+{c('│', D)}  {c('[13]', R)} - DB Uploader      {c('│', D)}  {c('[14]', R)} - Список баз         {c('│', D)}
+{c('╰───────────────────────────────────────────────────────╯', D)}
 """
 
 # ========================== DB UPLOADER API КЛИЕНТ ==========================
