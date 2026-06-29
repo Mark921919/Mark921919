@@ -1,17 +1,9 @@
-"""Lustia API Search — сервер для загрузки баз данных любого формата и полнотекстового поиска.
-
-Поддерживаемые форматы: CSV, TSV, JSON, XML, Excel (.xlsx/.xls), TXT
-
-Запуск:
-    pip install fastapi uvicorn python-multipart openpyxl
-    python lustia_api.py
-
-Документация: http://localhost:8000/docs
-"""
+"""Lustia API Server — полнотекстовый поиск и загрузка баз данных."""
 
 import csv
 import io
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -19,14 +11,12 @@ import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import uvicorn
 from fastapi import FastAPI, APIRouter, Form, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook
 
 
-# ──────────────────────────────────────────────
-# DATABASE (SQLite + FTS5)
-# ──────────────────────────────────────────────
+# ========================== БАЗА ДАННЫХ ==========================
 
 _DB_DIR = Path(__file__).resolve().parent / "data"
 _DB_PATH = _DB_DIR / "store.db"
@@ -85,12 +75,6 @@ def get_database_entry(name: str) -> dict | None:
     return dict(row) if row else None
 
 
-def list_databases_db() -> list[dict]:
-    conn = _get_conn()
-    rows = conn.execute("SELECT * FROM databases ORDER BY id").fetchall()
-    return [dict(r) for r in rows]
-
-
 def delete_database_entry(db_id: int) -> None:
     conn = _get_conn()
     conn.execute("DELETE FROM records WHERE db_id = ?", (db_id,))
@@ -98,7 +82,7 @@ def delete_database_entry(db_id: int) -> None:
     conn.commit()
 
 
-def insert_records(db_id: int, rows: list[str]) -> int:
+def insert_records_db(db_id: int, rows: list[str]) -> int:
     conn = _get_conn()
     conn.executemany(
         "INSERT INTO records (db_id, row_data) VALUES (?, ?)",
@@ -109,7 +93,6 @@ def insert_records(db_id: int, rows: list[str]) -> int:
 
 
 def get_columns(db_id: int) -> list[str]:
-    """Extract column names from the first record of a database."""
     conn = _get_conn()
     row = conn.execute(
         "SELECT row_data FROM records WHERE db_id = ? LIMIT 1", (db_id,)
@@ -124,12 +107,30 @@ def get_columns(db_id: int) -> list[str]:
     return cols
 
 
-def search_records(
+def count_records_db(db_id: int) -> int:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM records WHERE db_id = ?", (db_id,)
+    ).fetchone()
+    return row["cnt"]
+
+
+def _sanitize_fts_query(query: str) -> str:
+    tokens = re.findall(r"[\w]+", query, re.UNICODE)
+    if not tokens:
+        return '""'
+    quoted = []
+    for t in tokens:
+        t = t.replace('"', '""')
+        quoted.append(f'"{t}"')
+    return " ".join(quoted)
+
+
+def search_records_db(
     query: str, limit: int = 50, offset: int = 0, db_name: str | None = None
 ) -> tuple[list[dict], int]:
     conn = _get_conn()
-
-    # Count total matches
+    query = _sanitize_fts_query(query)
     if db_name:
         count_sql = """
             SELECT COUNT(*) AS cnt
@@ -176,21 +177,10 @@ def search_records(
             else:
                 item["data"] = part
         results.append(item)
-
     return results, total
 
 
-def count_records(db_id: int) -> int:
-    conn = _get_conn()
-    row = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM records WHERE db_id = ?", (db_id,)
-    ).fetchone()
-    return row["cnt"]
-
-
-# ──────────────────────────────────────────────
-# PARSER (все форматы)
-# ──────────────────────────────────────────────
+# ========================== ПАРСЕР ФАЙЛОВ ==========================
 
 _ENCODINGS = ["utf-8", "utf-8-sig", "cp1251", "latin-1"]
 
@@ -226,7 +216,7 @@ def parse_tsv(content: bytes) -> list[str]:
     return rows
 
 
-def parse_json(content: bytes) -> list[str]:
+def parse_json_file(content: bytes) -> list[str]:
     text = _decode(content)
     data = json.loads(text)
     if isinstance(data, list):
@@ -302,13 +292,8 @@ def parse_txt(content: bytes) -> list[str]:
 
 
 SUPPORTED_EXTENSIONS = {
-    ".csv": "CSV",
-    ".tsv": "TSV",
-    ".json": "JSON",
-    ".xml": "XML",
-    ".xlsx": "Excel",
-    ".xls": "Excel",
-    ".txt": "Text",
+    ".csv": "CSV", ".tsv": "TSV", ".json": "JSON",
+    ".xml": "XML", ".xlsx": "Excel", ".xls": "Excel", ".txt": "Text",
 }
 
 
@@ -319,7 +304,7 @@ def parse_file(filename: str, content: bytes) -> list[str]:
     if lower.endswith(".tsv"):
         return parse_tsv(content)
     if lower.endswith(".json"):
-        return parse_json(content)
+        return parse_json_file(content)
     if lower.endswith(".xml"):
         return parse_xml(content)
     if lower.endswith((".xlsx", ".xls")):
@@ -330,49 +315,35 @@ def parse_file(filename: str, content: bytes) -> list[str]:
     raise ValueError(f"Unsupported file type: {filename}. Supported: {supported}")
 
 
-# ──────────────────────────────────────────────
-# API ROUTES
-# ──────────────────────────────────────────────
+# ========================== FASTAPI МАРШРУТЫ ==========================
 
 router = APIRouter()
 
 
 @router.post("/upload")
-async def upload_database(file: UploadFile, name: str = Form(...)):
-    """Загрузить файл как новую базу данных."""
+async def api_upload(file: UploadFile, name: str = Form(...)):
     start = time.perf_counter()
-
     if not file.filename:
         raise HTTPException(status_code=400, detail="File has no name")
-
     db_name = name.strip()[:100]
     if not db_name:
         raise HTTPException(status_code=400, detail="Empty database name")
-
     existing = get_database_entry(db_name)
     if existing:
-        raise HTTPException(
-            status_code=409, detail=f"Database '{db_name}' already exists"
-        )
-
+        raise HTTPException(status_code=409, detail=f"Database '{db_name}' already exists")
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
-
     try:
         rows = parse_file(file.filename, content)
     except (ValueError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-
     if not rows:
         raise HTTPException(status_code=400, detail="File contains no records")
-
     db_id = create_database_entry(db_name)
-    inserted = insert_records(db_id, rows)
+    inserted = insert_records_db(db_id, rows)
     elapsed = time.perf_counter() - start
-
     columns = get_columns(db_id)
-
     return {
         "ok": True,
         "database": {
@@ -386,33 +357,32 @@ async def upload_database(file: UploadFile, name: str = Form(...)):
 
 
 @router.get("/databases")
-async def list_all_databases():
-    """Список всех загруженных баз данных."""
-    dbs = list_databases_db()
+async def api_list_databases():
+    conn = _get_conn()
+    rows = conn.execute("""
+        SELECT d.id, d.name, d.created_at,
+               COUNT(r.id) AS row_count
+        FROM databases d
+        LEFT JOIN records r ON r.db_id = d.id
+        GROUP BY d.id
+        ORDER BY d.id
+    """).fetchall()
     result = []
-    for db in dbs:
-        cnt = count_records(db["id"])
-        columns = get_columns(db["id"])
-        result.append(
-            {
-                "name": db["name"],
-                "rowCount": cnt,
-                "columns": columns,
-                "createdAt": db["created_at"],
-            }
-        )
+    for row in rows:
+        result.append({
+            "name": row["name"],
+            "rowCount": row["row_count"],
+            "createdAt": row["created_at"],
+        })
     return {"databases": result}
 
 
 @router.get("/databases/{db_name}")
-async def get_database_info(db_name: str):
-    """Информация о конкретной базе данных."""
+async def api_get_database(db_name: str):
     entry = get_database_entry(db_name)
     if not entry:
-        raise HTTPException(
-            status_code=404, detail=f"Database '{db_name}' not found"
-        )
-    cnt = count_records(entry["id"])
+        raise HTTPException(status_code=404, detail=f"Database '{db_name}' not found")
+    cnt = count_records_db(entry["id"])
     columns = get_columns(entry["id"])
     return {
         "name": entry["name"],
@@ -423,49 +393,36 @@ async def get_database_info(db_name: str):
 
 
 @router.delete("/databases/{db_name}")
-async def delete_database(db_name: str):
-    """Удалить базу данных и все её записи."""
+async def api_delete_database(db_name: str):
     entry = get_database_entry(db_name)
     if not entry:
-        raise HTTPException(
-            status_code=404, detail=f"Database '{db_name}' not found"
-        )
+        raise HTTPException(status_code=404, detail=f"Database '{db_name}' not found")
     delete_database_entry(entry["id"])
     return {"ok": True, "deleted": db_name}
 
 
 @router.get("/formats")
-async def supported_formats():
-    """Список поддерживаемых форматов файлов."""
+async def api_formats():
     return {"formats": SUPPORTED_EXTENSIONS}
 
 
 @router.get("/search")
-async def search_endpoint(
-    q: str = Query(..., min_length=1, description="Search query"),
-    db: str | None = Query(None, description="Limit to specific database"),
+async def api_search(
+    q: str = Query(..., min_length=1),
+    db: str | None = Query(None),
     limit: int = Query(100, ge=1, le=10000),
     offset: int = Query(0, ge=0),
 ):
-    """Полнотекстовый поиск по всем базам данных."""
     start = time.perf_counter()
-
     if db:
         entry = get_database_entry(db)
         if not entry:
-            raise HTTPException(
-                status_code=404, detail=f"Database '{db}' not found"
-            )
-
+            raise HTTPException(status_code=404, detail=f"Database '{db}' not found")
     try:
-        results, total_count = search_records(
-            q, limit=limit, offset=offset, db_name=db
-        )
+        results, total_count = search_records_db(q, limit=limit, offset=offset, db_name=db)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Search error: {exc}")
-
     elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
-
     return {
         "ok": True,
         "results": results,
@@ -475,10 +432,7 @@ async def search_endpoint(
     }
 
 
-# ──────────────────────────────────────────────
-# APP
-# ──────────────────────────────────────────────
-
+# ========================== ПРИЛОЖЕНИЕ ==========================
 
 @asynccontextmanager
 async def lifespan(a: FastAPI):
@@ -493,6 +447,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(router, prefix="/api")
 
 
@@ -501,11 +463,22 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/")
+async def root():
+    return {
+        "name": "Lustia API Search",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "endpoints": {
+            "upload": "POST /api/upload",
+            "search": "GET /api/search?q=query",
+            "databases": "GET /api/databases",
+            "formats": "GET /api/formats",
+        }
+    }
+
+
 if __name__ == "__main__":
-    uvicorn.run(
-        "lustia_api:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        reload_includes=["lustia_api.py"],
-    )
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("lustia_api:app", host="0.0.0.0", port=port)
